@@ -35,8 +35,7 @@ jobs:
 
           replace_once(
               '            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)',
-              '            # Process checks and environment checks may take several seconds.\n'
-              '            # Honour an Exit or Pause requested while they were running.\n'
+              '            # Honour Exit or Pause requested during the slow preflight checks.\n'
               '            if self.stop_event.is_set() or (self.paused and not manual):\n'
               '                return False\n'
               '            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)',
@@ -53,7 +52,6 @@ jobs:
               node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
               return node.lineno - 1, node.end_lineno
 
-          # Keep the launch lock held through taskkill, not just while setting pause.
           start, end = method_span('close_photoshop_forced')
           lines = source.splitlines(keepends=True)
           block = ''.join(lines[start:end])
@@ -65,7 +63,6 @@ jobs:
           lines[start:end] = [block]
           source = ''.join(lines)
 
-          # Free the native menu even if building/tracking/handling it raises.
           start, end = method_span('show_menu')
           lines = source.splitlines(keepends=True)
           block = ''.join(lines[start:end])
@@ -77,36 +74,34 @@ jobs:
           lines[start:end] = [block]
           source = ''.join(lines)
 
-          # Cleanup must tolerate partial startup and repeated WM_CLOSE/finally calls.
           start, end = method_span('shutdown')
           lines = source.splitlines(keepends=True)
-          replacement = '''    def shutdown(self) -> None:
-                  self.stop_event.set()
-                  hwnd = self.hwnd
-                  try:
-                      if hwnd:
-                          ctypes.windll.user32.KillTimer(hwnd, 1)
-                          try:
-                              if hasattr(self, "_notify_cls"):
-                                  nid = self._notify_cls()
-                                  nid.cbSize = ctypes.sizeof(self._notify_cls)
-                                  nid.hWnd = hwnd
-                                  nid.uID = 1
-                                  ctypes.windll.shell32.Shell_NotifyIconW(2, ctypes.byref(nid))
-                          finally:
-                              ctypes.windll.user32.DestroyWindow(hwnd)
-                  finally:
-                      self.hwnd = None
-                      try:
-                          if self.icon_handle and self._owns_icon:
-                              ctypes.windll.user32.DestroyIcon(self.icon_handle)
-                      finally:
-                          self.icon_handle = None
-                          self._owns_icon = False
-          '''
-          # Preserve the four-space class indentation without reformatting other code.
-          replacement = replacement.splitlines()
-          replacement = replacement[0] + '\n' + '\n'.join(line[6:] for line in replacement[1:]) + '\n'
+          replacement = '\n'.join([
+              '    def shutdown(self) -> None:',
+              '        self.stop_event.set()',
+              '        hwnd = self.hwnd',
+              '        try:',
+              '            if hwnd:',
+              '                ctypes.windll.user32.KillTimer(hwnd, 1)',
+              '                try:',
+              '                    if hasattr(self, "_notify_cls"):',
+              '                        nid = self._notify_cls()',
+              '                        nid.cbSize = ctypes.sizeof(self._notify_cls)',
+              '                        nid.hWnd = hwnd',
+              '                        nid.uID = 1',
+              '                        ctypes.windll.shell32.Shell_NotifyIconW(2, ctypes.byref(nid))',
+              '                finally:',
+              '                    ctypes.windll.user32.DestroyWindow(hwnd)',
+              '        finally:',
+              '            self.hwnd = None',
+              '            try:',
+              '                if self.icon_handle and self._owns_icon:',
+              '                    ctypes.windll.user32.DestroyIcon(self.icon_handle)',
+              '            finally:',
+              '                self.icon_handle = None',
+              '                self._owns_icon = False',
+              '',
+          ])
           lines[start:end] = [replacement]
           source = ''.join(lines)
           compile(source, str(path), 'exec')
