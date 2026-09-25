@@ -1,21 +1,16 @@
 name: Python tests
-
 on:
   push:
-    branches: [main]
+    branches: [main, release/v0.2.0-stability]
   pull_request:
   workflow_dispatch:
-
 permissions:
   contents: read
-
 env:
   PYTHONIOENCODING: utf-8
-
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   regression:
     name: Regression (${{ matrix.os }}, Python ${{ matrix.python }})
@@ -33,15 +28,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Compile Python sources including supervisor
+      - name: Compile all Python sources
         run: python -c "import pathlib, py_compile; [py_compile.compile(str(p), doraise=True) for p in pathlib.Path('.').iterdir() if p.suffix in ('.py', '.pyw')]"
-      - name: Built-in self-test (no Photoshop)
+      - name: Self-test
         run: python antilagphotoshop.py --self-test
-      - name: Regression tests (Photoshop OS calls mocked)
-        run: python -m unittest -v test_antilagphotoshop test_regressions test_supervisor_regressions test_guard_lifecycle
-
+      - name: All regression and diagnostics tests
+        run: python ci_tests.py
   native-windows:
-    name: Windows tray smoke tests (no Photoshop)
+    name: Native Windows tray and package checks
     runs-on: windows-latest
     timeout-minutes: 10
     steps:
@@ -51,5 +45,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
-      - name: Native tray, icons, heartbeat and guard lifecycle
-        run: python -m unittest -v test_windows_smoke
+      - name: Native tray smoke tests
+        run: python ci_tests.py --native
+      - name: Build and verify downloadable package
+        run: python build_release.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: antilagphotoshop-v0.2.0-windows-python
+          path: dist/*
+          if-no-files-found: error
