@@ -1,0 +1,55 @@
+name: Python tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONIOENCODING: utf-8
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    name: Regression (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.9', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile Python sources including supervisor
+        run: python -c "import pathlib, py_compile; [py_compile.compile(str(p), doraise=True) for p in pathlib.Path('.').iterdir() if p.suffix in ('.py', '.pyw')]"
+      - name: Built-in self-test (no Photoshop)
+        run: python antilagphotoshop.py --self-test
+      - name: Regression tests (Photoshop OS calls mocked)
+        run: python -m unittest -v test_antilagphotoshop test_regressions test_supervisor_regressions test_guard_lifecycle
+
+  native-windows:
+    name: Windows tray smoke tests (no Photoshop)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Native tray, icons, heartbeat and guard lifecycle
+        run: python -m unittest -v test_windows_smoke
