@@ -5,6 +5,8 @@ on:
     paths: [.github/workflows/apply-lifecycle-fix.yml]
 permissions:
   contents: write
+env:
+  PYTHONIOENCODING: utf-8
 jobs:
   apply:
     runs-on: windows-latest
