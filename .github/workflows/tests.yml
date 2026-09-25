@@ -32,7 +32,7 @@ jobs:
       - name: Built-in self-test (no Photoshop)
         run: python antilagphotoshop.py --self-test
       - name: Regression tests (Photoshop OS calls mocked)
-        run: python -m unittest -v test_antilagphotoshop test_regressions test_supervisor_regressions
+        run: python -m unittest -v test_antilagphotoshop test_regressions test_supervisor_regressions test_guard_lifecycle
 
   native-windows:
     name: Windows tray smoke tests (no Photoshop)
