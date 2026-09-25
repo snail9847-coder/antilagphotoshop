@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.log
+*.log.*
+*.heartbeat
+*.tmp
+.venv/
+venv/
+.env
+.env.*
+!.env.example
