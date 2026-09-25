@@ -336,25 +336,25 @@ class AntilagPhotoshop:
         # This method is reachable from the UI only after two confirmations.
         with self._launch_lock:
             self.paused = True
-        try:
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            result = subprocess.run(
-                ["taskkill", "/F", "/IM", PROCESS_NAME],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                creationflags=flags,
-                check=False,
-            )
-            ok = result.returncode == 0
-            if ok:
-                self.log.warning("Photoshop закрыт принудительно по команде пользователя")
-            else:
-                self.log.error("taskkill завершился с кодом %s", result.returncode)
-            return ok
-        except (OSError, subprocess.SubprocessError) as exc:
-            self.log.error("Не удалось принудительно закрыть Photoshop: %s", exc)
-            return False
+            try:
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                result = subprocess.run(
+                    ["taskkill", "/F", "/IM", PROCESS_NAME],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    creationflags=flags,
+                    check=False,
+                )
+                ok = result.returncode == 0
+                if ok:
+                    self.log.warning("Photoshop закрыт принудительно по команде пользователя")
+                else:
+                    self.log.error("taskkill завершился с кодом %s", result.returncode)
+                return ok
+            except (OSError, subprocess.SubprocessError) as exc:
+                self.log.error("Не удалось принудительно закрыть Photoshop: %s", exc)
+                return False
 
     def _main_window(self) -> Optional[int]:
         """HWND of the Photoshop main window (class name starts with 'Photoshop')."""
@@ -468,6 +468,9 @@ class AntilagPhotoshop:
                 self.balloon("Запуск Photoshop отменён", health, error=True)
                 if not manual:
                     self.paused = True
+                return False
+            # Honour Exit or Pause requested during the slow preflight checks.
+            if self.stop_event.is_set() or (self.paused and not manual):
                 return False
             flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             self.our_process = subprocess.Popen(
@@ -729,6 +732,7 @@ class AntilagPhotoshop:
             self.log.exception("Не удалось показать уведомление")
 
     def show_menu(self) -> None:
+        menu = None
         try:
             user32 = ctypes.windll.user32
             menu = user32.CreatePopupMenu()
@@ -754,14 +758,14 @@ class AntilagPhotoshop:
             user32.GetCursorPos(ctypes.byref(point))
             user32.SetForegroundWindow(self.hwnd)
             selected = user32.TrackPopupMenu(menu, 0x0100 | 0x0000, point.x, point.y, 0, self.hwnd, None)
-            user32.DestroyMenu(menu)
             if selected == 1001:
                 self._run_async(self.launch_photoshop, True)
             elif selected == 1002:
                 self.last_state = None
                 self._run_async(self._check_now)
             elif selected == 1003:
-                self.paused = not self.paused
+                # Resume also works when started with --no-auto-start.
+                self.paused = bool(self.auto_start and not self.paused)
                 if not self.paused:
                     self.auto_start = True
                     self.policy.reset()
@@ -806,6 +810,9 @@ class AntilagPhotoshop:
                 self.shutdown()
         except Exception:
             self.log.exception("Ошибка контекстного меню")
+        finally:
+            if menu:
+                ctypes.windll.user32.DestroyMenu(menu)
 
     def _check_now(self) -> None:
         self.last_state = None
@@ -818,21 +825,27 @@ class AntilagPhotoshop:
 
     def shutdown(self) -> None:
         self.stop_event.set()
-        if self.hwnd:
-            ctypes.windll.user32.KillTimer(self.hwnd, 1)
+        hwnd = self.hwnd
+        try:
+            if hwnd:
+                ctypes.windll.user32.KillTimer(hwnd, 1)
+                try:
+                    if hasattr(self, "_notify_cls"):
+                        nid = self._notify_cls()
+                        nid.cbSize = ctypes.sizeof(self._notify_cls)
+                        nid.hWnd = hwnd
+                        nid.uID = 1
+                        ctypes.windll.shell32.Shell_NotifyIconW(2, ctypes.byref(nid))
+                finally:
+                    ctypes.windll.user32.DestroyWindow(hwnd)
+        finally:
+            self.hwnd = None
             try:
-                nid = self._notify_cls()
-                nid.cbSize = ctypes.sizeof(self._notify_cls)
-                nid.hWnd = self.hwnd
-                nid.uID = 1
-                ctypes.windll.shell32.Shell_NotifyIconW(2, ctypes.byref(nid))  # NIM_DELETE
+                if self.icon_handle and self._owns_icon:
+                    ctypes.windll.user32.DestroyIcon(self.icon_handle)
             finally:
-                ctypes.windll.user32.DestroyWindow(self.hwnd)
-                self.hwnd = None
-        if self.icon_handle and self._owns_icon:
-            ctypes.windll.user32.DestroyIcon(self.icon_handle)
-            self.icon_handle = None
-            self._owns_icon = False
+                self.icon_handle = None
+                self._owns_icon = False
 
     def run(self) -> int:
         if os.name != "nt":
