@@ -27,8 +27,11 @@ class RegressionTests(unittest.TestCase):
              patch.object(app, 'find_photoshop', return_value=Path('C:/Photoshop.exe')), \
              patch.object(self.guard, 'environment_health', return_value=None), \
              patch.object(app.subprocess, 'Popen', side_effect=OSError('Denied')) as launch:
-            for _ in range(10):
-                self.guard.launch_photoshop()
+            base = app.time.monotonic()
+            with patch.object(app.time, "monotonic", return_value=base) as clock:
+                for attempt in range(10):
+                    clock.return_value = base + attempt * 61
+                    self.guard.launch_photoshop()
         self.assertEqual(launch.call_count, app.MAX_ATTEMPTS)
         self.assertEqual(self.guard.policy.attempts(), app.MAX_ATTEMPTS)
         self.assertTrue(self.guard.paused)
@@ -36,8 +39,11 @@ class RegressionTests(unittest.TestCase):
     def test_missing_path_is_bounded(self):
         with patch.object(self.guard, 'is_photoshop_running', return_value=False), \
              patch.object(app, 'find_photoshop', return_value=None):
-            for _ in range(10):
-                self.guard.launch_photoshop()
+            base = app.time.monotonic()
+            with patch.object(app.time, "monotonic", return_value=base) as clock:
+                for attempt in range(10):
+                    clock.return_value = base + attempt * 61
+                    self.guard.launch_photoshop()
         self.assertEqual(self.guard.policy.attempts(), app.MAX_ATTEMPTS)
         self.assertTrue(self.guard.paused)
 
