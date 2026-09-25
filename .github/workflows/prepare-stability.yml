@@ -1,0 +1,175 @@
+name: Prepare stability changes
+on:
+  push:
+    branches: [release/v0.2.0-stability]
+    paths: [.github/workflows/prepare-stability.yml]
+permissions:
+  contents: write
+env:
+  PYTHONIOENCODING: utf-8
+jobs:
+  prepare:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: release/v0.2.0-stability
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Apply reviewed edits
+        shell: python
+        run: |
+          import ast
+          from pathlib import Path
+          import textwrap
+          path = Path('antilagphotoshop.py')
+          source = path.read_text(encoding='utf-8')
+          def once(old, new):
+              global source
+              if source.count(old) != 1:
+                  raise RuntimeError('Source mismatch: ' + repr(old))
+              source = source.replace(old, new, 1)
+          def method(name, text):
+              global source
+              tree = ast.parse(source)
+              cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'AntilagPhotoshop')
+              node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
+              lines = source.splitlines(True)
+              lines[node.lineno-1:node.end_lineno] = [textwrap.indent(textwrap.dedent(text).strip(), '    ') + '\n']
+              source = ''.join(lines)
+          once('from antilagphotoshop_winapi import configure_winapi',
+               'from antilagphotoshop_winapi import configure_winapi\nfrom antilagphotoshop_stability import ProcessSnapshot, ResourceWarnings, RestartSchedule')
+          once('CHECK_INTERVAL_SECONDS = 2', 'CHECK_INTERVAL_SECONDS = 5')
+          once('HANG_CHECK_EVERY = 5  # in monitor ticks (~10 s of wall time)', 'HANG_CHECK_EVERY = 2  # in monitor ticks (~10 s of wall time)')
+          once('        self._launch_lock = threading.Lock()', '        self._launch_lock = threading.Lock()\n        self._restart_schedule = RestartSchedule()\n        self._resource_warnings = ResourceWarnings()\n        self._process_snapshot = ProcessSnapshot()')
+          method('is_photoshop_running', '''
+          def _query_photoshop_pids(self):
+              """Fresh query for launch safety. Unknown never becomes an empty set."""
+              try:
+                  result = subprocess.run(
+                      ["tasklist", "/FI", f"IMAGENAME eq {PROCESS_NAME}", "/FO", "CSV", "/NH"],
+                      capture_output=True, text=True, encoding="utf-8", errors="replace",
+                      timeout=4, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False,
+                  )
+                  if result.returncode != 0:
+                      raise OSError(f"tasklist exit code {result.returncode}")
+                  pids = set()
+                  for row in csv.reader((result.stdout or "").splitlines()):
+                      if row and row[0].lower() == PROCESS_NAME.lower():
+                          if len(row) < 2:
+                              raise ValueError("Missing Photoshop PID")
+                          pid = int(row[1])
+                          if pid <= 0:
+                              raise ValueError("Invalid Photoshop PID")
+                          pids.add(pid)
+                  self._process_snapshot.publish(pids, time.monotonic())
+                  return pids
+              except (OSError, ValueError, csv.Error, subprocess.SubprocessError) as exc:
+                  self._process_snapshot.publish(None, time.monotonic())
+                  self.log.warning("Не удалось проверить процесс Photoshop: %s", exc)
+                  return None
+
+          def is_photoshop_running(self) -> Optional[bool]:
+              pids = self._query_photoshop_pids()
+              return None if pids is None else bool(pids)
+          ''')
+          method('photoshop_pids', '''
+          def photoshop_pids(self) -> set[int]:
+              pids = self._process_snapshot.recent(time.monotonic())
+              if pids is None:
+                  pids = self._query_photoshop_pids()
+              return set() if pids is None else pids
+          ''')
+          once('            running = self.is_photoshop_running()\n            if running is None:',
+               '            running = self.is_photoshop_running()\n            self._restart_schedule.observe(running, time.monotonic())\n            if running is None:')
+          once('            # Record BEFORE lookup/Popen: failed launches must count as attempts.',
+               '            if not manual and not self._restart_schedule.can_attempt(time.monotonic()):\n                return False\n            # Record BEFORE lookup/Popen: failed launches must count as attempts.')
+          once('            self.policy.record_attempt()\n            path = find_photoshop(self.explicit_path)',
+               '            self.policy.record_attempt()\n            self._restart_schedule.record_attempt(time.monotonic(), self.policy.attempts())\n            path = find_photoshop(self.explicit_path)')
+          once('            self._run_async(self._window_after_launch)\n', '')
+          method('_window_after_launch', '''
+          def _window_after_launch(self) -> None:
+              """Compatibility hook. Never manipulate Photoshop windows automatically."""
+              return None
+          ''')
+          once('                running = self.is_photoshop_running()\n                self._tick += 1',
+               '                running = self.is_photoshop_running()\n                if self._launch_lock.acquire(blocking=False):\n                    try:\n                        self._restart_schedule.observe(running, time.monotonic())\n                    finally:\n                        self._launch_lock.release()\n                self._tick += 1')
+          once('                if running is True:\n', '                if running is True:\n                    self._check_resources()\n')
+          method('environment_health', '''
+          def environment_health(self, photoshop_path: Optional[Path]) -> Optional[str]:
+              """Read-only pressure checks; install drive is not the scratch disk."""
+              problems = []
+              ram = self.free_ram_mb()
+              if ram is not None and ram < MIN_FREE_RAM_MB:
+                  problems.append(f"Мало свободной RAM: {ram} МБ")
+              seen = set()
+              paths = [
+                  ("системный диск", os.environ.get("SYSTEMDRIVE", "C:")),
+                  ("диск установки", str(photoshop_path) if photoshop_path else None),
+                  ("диск TEMP", os.environ.get("TEMP")),
+              ]
+              for label, value in paths:
+                  if not value:
+                      continue
+                  root = str(Path(value).anchor or Path(value).resolve().anchor)
+                  root = root.rstrip("\\\\/").casefold()
+                  if root in seen:
+                      continue
+                  seen.add(root)
+                  disk = self.free_disk_mb(value)
+                  if disk is not None and disk < MIN_FREE_DISK_MB:
+                      problems.append(f"Мало места ({label}): {disk} МБ")
+              return "; ".join(problems) if problems else None
+
+          def _check_resources(self) -> None:
+              now = time.monotonic()
+              if not self._resource_warnings.check_due(now):
+                  return
+              try:
+                  problem = self.environment_health(find_photoshop(self.explicit_path))
+                  if self._resource_warnings.should_notify(problem, now):
+                      self.log.warning("Недостаточно ресурсов: %s", problem)
+                      self.balloon("Мало ресурсов", (problem + ". Сохраните работу; проверьте RAM и диски.")[:255], error=True)
+              except Exception:
+                  self.log.exception("Не удалось проверить доступные ресурсы")
+          ''')
+          once('            root = str(Path(path).anchor or Path(path).drive or "C:\\\\")',
+               '            root = str(Path(path).anchor or Path(path).resolve().anchor)\n            if root.endswith(":"):\n                root += "\\\\"')
+          compile(source, str(path), 'exec')
+          with path.open('w', encoding='utf-8', newline='\n') as out:
+              out.write(source)
+
+          # Existing circuit-breaker tests must advance time through the new cooldown.
+          tests = Path('test_regressions.py')
+          text = tests.read_text(encoding='utf-8')
+          old = '            for _ in range(10):\n                self.guard.launch_photoshop()'
+          if text.count(old) != 2:
+              raise RuntimeError('Unexpected circuit-breaker tests')
+          new = ('            base = app.time.monotonic()\n'
+                 '            with patch.object(app.time, "monotonic", return_value=base) as clock:\n'
+                 '                for attempt in range(10):\n'
+                 '                    clock.return_value = base + attempt * 61\n'
+                 '                    self.guard.launch_photoshop()')
+          with tests.open('w', encoding='utf-8', newline='\n') as out:
+              out.write(text.replace(old, new))
+      - name: Compile and test all modules
+        run: |
+          python -m compileall -q .
+          python -m unittest -v test_antilagphotoshop test_regressions test_supervisor_regressions test_guard_lifecycle test_stability test_diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m unittest -v test_windows_smoke
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Commit verified application changes
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- antilagphotoshop.py test_regressions.py
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git commit -m "feat: reduce polling, delay restarts, warn about resources without changing Photoshop windows"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git push origin HEAD:release/v0.2.0-stability
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
