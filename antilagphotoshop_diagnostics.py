@@ -46,6 +46,16 @@ def local_iso_now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def configure_output_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(errors="backslashreplace")
+            except (OSError, ValueError, TypeError):
+                pass
+
+
 def prepare_output_dir(requested: Optional[str]) -> Path:
     if requested:
         target = Path(requested).expanduser()
@@ -56,7 +66,10 @@ def prepare_output_dir(requested: Optional[str]) -> Path:
     root = diagnostics_root()
     root.mkdir(parents=True, exist_ok=True)
     for _ in range(20):
-        name = f"report-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        name = (
+            f"report-{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
+            f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        )
         target = root / name
         try:
             target.mkdir(parents=False, exist_ok=False)
@@ -252,7 +265,12 @@ $status = if ($filtered.Count -gt 0) {{ 'ok' }} else {{ 'no_events' }}
     except FileNotFoundError:
         return error_result("PowerShell was not found.")
     except subprocess.TimeoutExpired:
-        return {"status": "timeout", "reason": "PowerShell timed out after 20 seconds.", "events": [], "scan_scope": EVENT_SCAN_NOTE}
+        return {
+            "status": "timeout",
+            "reason": "PowerShell timed out after 20 seconds.",
+            "events": [],
+            "scan_scope": EVENT_SCAN_NOTE,
+        }
     except OSError as exc:
         return error_result(str(exc))
 
@@ -277,8 +295,8 @@ def build_report() -> Dict[str, Any]:
     return {
         "created_at_local": local_iso_now(),
         "privacy_note": (
-            "This report stays local. It can contain private file paths and Windows event messages. "
-            "Review it before you publish it anywhere."
+            "This report stays local. It can contain private file paths and Windows event "
+            "messages. Review it before you publish it anywhere."
         ),
         "scope": [
             "Read-only diagnostics only",
@@ -359,7 +377,15 @@ def render_text(report: Dict[str, Any]) -> str:
         lines.append("- No matching events found in the scanned event set.")
     else:
         lines.append(f"- {events['status']}: {events.get('reason')}")
-    lines.extend(["", "Guard log tail:", report["logs"]["guard_log"]["text"], "", "Supervisor log tail:", report["logs"]["supervisor_log"]["text"], ""])
+    lines.extend([
+        "",
+        "Guard log tail:",
+        report["logs"]["guard_log"]["text"],
+        "",
+        "Supervisor log tail:",
+        report["logs"]["supervisor_log"]["text"],
+        "",
+    ])
     return "\n".join(lines)
 
 
@@ -374,6 +400,7 @@ def write_report_bundle(report: Dict[str, Any], output_dir: Path) -> Tuple[Path,
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    configure_output_streams()
     parser = argparse.ArgumentParser(description="Collect local read-only diagnostics for antilagphotoshop.")
     parser.add_argument("--output", help="Optional output directory path. It must not already exist.")
     args = parser.parse_args(argv)

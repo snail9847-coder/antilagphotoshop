@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -121,6 +123,56 @@ class DiagnosticsTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 diag.write_report_bundle(report, output_dir)
 
+    def test_main_handles_unicode_output_with_ascii_streams(self) -> None:
+        report = {
+            "created_at_local": "2026-09-25T18:00:00+03:00",
+            "privacy_note": "note",
+            "scope": [],
+            "system": {
+                "platform": "p",
+                "python_version": "3.11",
+                "python_executable": "python",
+                "available_ram_mb": 1,
+            },
+            "configured_photoshop": {
+                "config_file": "c",
+                "configured_path": None,
+                "configured_path_exists": False,
+            },
+            "disk_free_space": {},
+            "logs": {"guard_log": {"text": ""}, "supervisor_log": {"text": ""}},
+            "windows_application_events": {
+                "status": "no_events",
+                "events": [],
+                "scan_scope": "scope",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "отчёт"
+            text_path = output_dir / "диагностика.txt"
+            json_path = output_dir / "диагностика.json"
+            stdout_buffer = io.BytesIO()
+            stderr_buffer = io.BytesIO()
+            stdout_stream = io.TextIOWrapper(stdout_buffer, encoding="ascii", errors="strict")
+            stderr_stream = io.TextIOWrapper(stderr_buffer, encoding="ascii", errors="strict")
+            old_stdout, old_stderr = sys.stdout, sys.stderr
+            try:
+                sys.stdout = stdout_stream
+                sys.stderr = stderr_stream
+                with mock.patch.object(diag, "prepare_output_dir", return_value=output_dir), mock.patch.object(
+                    diag, "build_report", return_value=report
+                ), mock.patch.object(diag, "write_report_bundle", return_value=(text_path, json_path)):
+                    result = diag.main([])
+                stdout_stream.flush()
+                stderr_stream.flush()
+            finally:
+                sys.stdout = old_stdout
+                sys.stderr = old_stderr
+        self.assertEqual(result, 0)
+        output_text = stdout_buffer.getvalue().decode("ascii")
+        self.assertIn("Diagnostics created locally.", output_text)
+        self.assertIn(r"\u043e", output_text)
+
     def test_build_report_reads_expected_local_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -152,7 +204,8 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertFalse(report["configured_photoshop"]["configured_path_exists"])
         self.assertEqual(report["logs"]["guard_log"]["text"], "guard tail")
         self.assertEqual(report["windows_application_events"]["status"], "no_events")
-        self.assertIn("+", report["created_at_local"])
+        self.assertRegex(report["created_at_local"], r".*[+-]\d{2}:\d{2}$")
+        self.assertIsNotNone(datetime.fromisoformat(report["created_at_local"]))
 
     @unittest.skipUnless(diag.is_windows(), "Windows only")
     def test_collect_diagnostics_bat_preserves_nonzero_exit_code(self) -> None:
