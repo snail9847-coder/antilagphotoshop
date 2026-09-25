@@ -28,14 +28,15 @@ import time
 from typing import Optional
 
 from antilagphotoshop_winapi import configure_winapi
+from antilagphotoshop_stability import ProcessSnapshot, ResourceWarnings, RestartSchedule
 
 APP_NAME = "antilagphotoshop"
 PROCESS_NAME = "Photoshop.exe"
-CHECK_INTERVAL_SECONDS = 2
+CHECK_INTERVAL_SECONDS = 5
 MAX_ATTEMPTS = 3
 ATTEMPT_WINDOW_SECONDS = 10 * 60
 HANG_NOTIFY_SECONDS = 45
-HANG_CHECK_EVERY = 5  # in monitor ticks (~10 s of wall time)
+HANG_CHECK_EVERY = 2  # in monitor ticks (~10 s of wall time)
 MIN_FREE_RAM_MB = 400
 MIN_FREE_DISK_MB = 2048
 CONFIG_PATH_FILE = Path(__file__).with_name("photoshop_path.txt")
@@ -148,6 +149,9 @@ class AntilagPhotoshop:
         configure_winapi()
         self.log = configure_logging()
         self._launch_lock = threading.Lock()
+        self._restart_schedule = RestartSchedule()
+        self._resource_warnings = ResourceWarnings()
+        self._process_snapshot = ProcessSnapshot()
         self._last_monitor_tick = time.monotonic()
         self._owns_icon = False
         self._taskbar_created = 0
@@ -176,58 +180,41 @@ class AntilagPhotoshop:
         ))
 
     # -------------------- Process layer --------------------
-    def is_photoshop_running(self) -> Optional[bool]:
-        """Use tasklist with a timeout; a stuck tasklist cannot freeze the guard."""
+    def _query_photoshop_pids(self):
+        """Fresh query for launch safety. Unknown never becomes an empty set."""
         try:
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             result = subprocess.run(
                 ["tasklist", "/FI", f"IMAGENAME eq {PROCESS_NAME}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=4,
-                creationflags=flags,
-                check=False,
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=4, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), check=False,
             )
             if result.returncode != 0:
-                self.log.warning("tasklist завершился с кодом %s", result.returncode)
-                return None
-            return any(
-                row and row[0].lower() == PROCESS_NAME.lower()
-                for row in csv.reader((result.stdout or "").splitlines())
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
+                raise OSError(f"tasklist exit code {result.returncode}")
+            pids = set()
+            for row in csv.reader((result.stdout or "").splitlines()):
+                if row and row[0].lower() == PROCESS_NAME.lower():
+                    if len(row) < 2:
+                        raise ValueError("Missing Photoshop PID")
+                    pid = int(row[1])
+                    if pid <= 0:
+                        raise ValueError("Invalid Photoshop PID")
+                    pids.add(pid)
+            self._process_snapshot.publish(pids, time.monotonic())
+            return pids
+        except (OSError, ValueError, csv.Error, subprocess.SubprocessError) as exc:
+            self._process_snapshot.publish(None, time.monotonic())
             self.log.warning("Не удалось проверить процесс Photoshop: %s", exc)
             return None
 
+    def is_photoshop_running(self) -> Optional[bool]:
+        pids = self._query_photoshop_pids()
+        return None if pids is None else bool(pids)
+
     def photoshop_pids(self) -> set[int]:
-        """CSV-mode tasklist gives PIDs, needed for window-level checks."""
-        try:
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            result = subprocess.run(
-                ["tasklist", "/FI", f"IMAGENAME eq {PROCESS_NAME}", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=4,
-                creationflags=flags,
-                check=False,
-            )
-            if result.returncode != 0:
-                return set()
-            pids: set[int] = set()
-            for parts in csv.reader((result.stdout or "").splitlines()):
-                if len(parts) >= 2 and parts[0].lower() == PROCESS_NAME.lower():
-                    try:
-                        pids.add(int(parts[1]))
-                    except ValueError:
-                        continue
-            return pids
-        except (OSError, subprocess.SubprocessError) as exc:
-            self.log.warning("Не удалось получить PID Photoshop: %s", exc)
-            return set()
+        pids = self._process_snapshot.recent(time.monotonic())
+        if pids is None:
+            pids = self._query_photoshop_pids()
+        return set() if pids is None else pids
 
     def free_ram_mb(self) -> Optional[int]:
         """Available physical memory in MB, or None if the API failed."""
@@ -256,7 +243,9 @@ class AntilagPhotoshop:
     def free_disk_mb(self, path: str) -> Optional[int]:
         """Free space on the drive of `path` in MB, or None if the API failed."""
         try:
-            root = str(Path(path).anchor or Path(path).drive or "C:\\")
+            root = str(Path(path).anchor or Path(path).resolve().anchor)
+            if root.endswith(":"):
+                root += "\\"
             free = ctypes.c_ulonglong()
             total = ctypes.c_ulonglong()
             if ctypes.windll.kernel32.GetDiskFreeSpaceExW(root, ctypes.byref(free), ctypes.byref(total), None):
@@ -266,22 +255,41 @@ class AntilagPhotoshop:
         return None
 
     def environment_health(self, photoshop_path: Optional[Path]) -> Optional[str]:
-        """Return a human-readable problem string, or None if the environment is healthy.
-        Photoshop crashes are most often caused by low RAM or a full scratch/system disk;
-        catching this before launch prevents a pointless restart into the same crash."""
+        """Read-only pressure checks; install drive is not the scratch disk."""
+        problems = []
         ram = self.free_ram_mb()
         if ram is not None and ram < MIN_FREE_RAM_MB:
-            return f"Свободно всего {ram} МБ ОЗУ. Photoshop почти наверняка упадёт"
-        for label, path in (
-            ("системном", os.environ.get("SYSTEMDrive", "C:")),
-            ("диске Photoshop", str(photoshop_path) if photoshop_path else None),
-        ):
-            if not path:
+            problems.append(f"Мало свободной RAM: {ram} МБ")
+        seen = set()
+        paths = [
+            ("системный диск", os.environ.get("SYSTEMDRIVE", "C:")),
+            ("диск установки", str(photoshop_path) if photoshop_path else None),
+            ("диск TEMP", os.environ.get("TEMP")),
+        ]
+        for label, value in paths:
+            if not value:
                 continue
-            disk = self.free_disk_mb(path)
+            root = str(Path(value).anchor or Path(value).resolve().anchor)
+            root = root.rstrip("\\/").casefold()
+            if root in seen:
+                continue
+            seen.add(root)
+            disk = self.free_disk_mb(value)
             if disk is not None and disk < MIN_FREE_DISK_MB:
-                return f"Свободно всего {disk} МБ на {label} диске. Photoshop упадёт или зависнет"
-        return None
+                problems.append(f"Мало места ({label}): {disk} МБ")
+        return "; ".join(problems) if problems else None
+
+    def _check_resources(self) -> None:
+        now = time.monotonic()
+        if not self._resource_warnings.check_due(now):
+            return
+        try:
+            problem = self.environment_health(find_photoshop(self.explicit_path))
+            if self._resource_warnings.should_notify(problem, now):
+                self.log.warning("Недостаточно ресурсов: %s", problem)
+                self.balloon("Мало ресурсов", (problem + ". Сохраните работу; проверьте RAM и диски.")[:255], error=True)
+        except Exception:
+            self.log.exception("Не удалось проверить доступные ресурсы")
 
     def _photoshop_windows(self) -> list[tuple[int, int]]:
         """Visible top-level windows of Photoshop: [(hwnd, pid), ...]."""
@@ -442,6 +450,7 @@ class AntilagPhotoshop:
             if self.stop_event.is_set() or (self.paused and not manual):
                 return False
             running = self.is_photoshop_running()
+            self._restart_schedule.observe(running, time.monotonic())
             if running is None:
                 self.balloon("Проверка недоступна", "Не удалось проверить процессы. Повторный запуск отменён", error=True)
                 return False
@@ -455,8 +464,11 @@ class AntilagPhotoshop:
                 self.log.error("Автозапуск приостановлен: слишком много попыток")
                 self.balloon("Автозапуск приостановлен", "Проверьте путь к Photoshop и журнал", error=True)
                 return False
+            if not manual and not self._restart_schedule.can_attempt(time.monotonic()):
+                return False
             # Record BEFORE lookup/Popen: failed launches must count as attempts.
             self.policy.record_attempt()
+            self._restart_schedule.record_attempt(time.monotonic(), self.policy.attempts())
             path = find_photoshop(self.explicit_path)
             if not path:
                 self.log.error("Photoshop 2020 не найден")
@@ -478,7 +490,6 @@ class AntilagPhotoshop:
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 close_fds=True, creationflags=flags,
             )
-            self._run_async(self._window_after_launch)
             self.log.info("Запущен Photoshop: %s", path)
             self.balloon("Photoshop 2020", "Запуск выполнен")
             return True
@@ -503,8 +514,14 @@ class AntilagPhotoshop:
             self._last_monitor_tick = time.monotonic()
             try:
                 running = self.is_photoshop_running()
+                if self._launch_lock.acquire(blocking=False):
+                    try:
+                        self._restart_schedule.observe(running, time.monotonic())
+                    finally:
+                        self._launch_lock.release()
                 self._tick += 1
                 if running is True:
+                    self._check_resources()
                     if self.last_state is False:
                         self.log.info("Photoshop снова работает")
                     self.hang_notified = self.hang_notified if self.last_state else False
@@ -527,20 +544,8 @@ class AntilagPhotoshop:
                 return
 
     def _window_after_launch(self) -> None:
-        """After Photoshop (re)appears: wait for its main window, then keep it
-        windowed. Retries for ~60 s because Photoshop boots slowly."""
-        for _ in range(30):
-            if self.stop_event.is_set():
-                return
-            hwnd = self._main_window()
-            if hwnd:
-                user32 = ctypes.windll.user32
-                # SW_RESTORE beats leftover maximized/black states after a crash.
-                user32.ShowWindowAsync(hwnd, 9)
-                time.sleep(2)
-                user32.ShowWindowAsync(hwnd, 9)
-                return
-            time.sleep(2)
+        """Compatibility hook. Never manipulate Photoshop windows automatically."""
+        return None
 
     def _check_hang(self) -> None:
         """Detect a not-responding Photoshop. Nothing is ever killed here."""
