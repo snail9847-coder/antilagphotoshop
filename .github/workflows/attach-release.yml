@@ -1,0 +1,43 @@
+name: Attach tested v0.2.0 package
+on:
+  push:
+    branches: [build/v0.2.0-package]
+    paths: [.github/workflows/attach-release.yml]
+permissions:
+  contents: write
+env:
+  PYTHONIOENCODING: utf-8
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 0187f1e7f927f18403e60fa14393bab8ce69edda
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Verify pinned source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne "0187f1e7f927f18403e60fa14393bab8ce69edda") { throw "Unexpected source" }
+          python ci_tests.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python ci_tests.py --native
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python build_release.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Attach ZIP and checksum to draft release only
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $release = gh api repos/snail9847-coder/antilagphotoshop/releases/396862285 | ConvertFrom-Json
+          if (-not $release.draft -or $release.tag_name -ne "v0.2.0" -or $release.target_commitish -ne "0187f1e7f927f18403e60fa14393bab8ce69edda") { throw "Unexpected release" }
+          foreach ($file in Get-ChildItem dist -File) {
+            $url = "https://uploads.github.com/repos/snail9847-coder/antilagphotoshop/releases/396862285/assets?name=$($file.Name)"
+            gh api --method POST $url -H "Content-Type: application/octet-stream" --input $file.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
